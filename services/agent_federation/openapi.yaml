@@ -1,0 +1,268 @@
+openapi: 3.1.0
+info:
+  title: XIBRA Network Enterprise API
+  version: 2024.1.0
+  description: |
+    Enterprise-grade API for multi-agent orchestration and resource management
+  termsOfService: https://xibra.network/terms
+  contact:
+    name: API Support
+    url: https://support.xibra.network
+    email: api@xibra.network
+  license:
+    name: Proprietary
+    url: https://xibra.network/license
+
+servers:
+  - url: https://api.xibra.network/v1
+    description: Production cluster
+    variables:
+      environment:
+        default: production
+        enum: [production, staging, dev]
+  - url: https://{region}.api.xibra.network/v1
+    description: Regional endpoints
+    variables:
+      region:
+        default: us-west1
+        enum: [us-west1, eu-central1, ap-northeast2]
+
+securitySchemes:
+  OAuth2:
+    type: oauth2
+    flows:
+      clientCredentials:
+        tokenUrl: https://auth.xibra.network/oauth2/token
+        scopes:
+          agents:rw: Full agent management
+          resources:rw: Resource allocation
+          monitoring:ro: Read monitoring data
+  APIKey:
+    type: apiKey
+    in: header
+    name: X-API-Key
+
+paths:
+  /agents:
+    get:
+      tags: [Agent Management]
+      summary: List registered AI agents
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/pageSize'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, standby, error]
+      responses:
+        200:
+          description: Paginated agent list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentList'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Agent Management]
+      summary: Register new AI agent
+      security:
+        - OAuth2: [agents:rw]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentRegistration'
+      responses:
+        201:
+          description: Agent created
+          headers:
+            Location:
+              schema:
+                type: string
+              description: URI of new agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        400:
+          $ref: '#/components/responses/BadRequest'
+
+  /agents/{agentId}:
+    parameters:
+      - $ref: '#/components/parameters/agentId'
+    get:
+      tags: [Agent Management]
+      summary: Get agent details
+      responses:
+        200:
+          description: Agent details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        404:
+          $ref: '#/components/responses/NotFound'
+
+  /resources/allocations:
+    post:
+      tags: [Resource Management]
+      summary: Request resource allocation
+      security:
+        - OAuth2: [resources:rw]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResourceRequest'
+      responses:
+        202:
+          description: Allocation request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllocationTicket'
+        429:
+          $ref: '#/components/responses/TooManyRequests'
+
+  /messages:
+    post:
+      tags: [Agent Communication]
+      summary: Send inter-agent message
+      security:
+        - APIKey: []
+      requestBody:
+        required: true
+        content:
+          application/x-protobuf:
+            schema:
+              $ref: '#/components/schemas/AgentMessage'
+      responses:
+        202:
+          description: Message accepted for delivery
+        413:
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /monitoring/metrics:
+    get:
+      tags: [Monitoring]
+      summary: Retrieve system metrics
+      security:
+        - APIKey: []
+      parameters:
+        - $ref: '#/components/parameters/metricsFilter'
+      responses:
+        200:
+          description: Monitoring data
+          content:
+            application/x-protobuf:
+              schema:
+                $ref: '#/components/schemas/MetricStream'
+
+components:
+  schemas:
+    Agent:
+      type: object
+      required: [id, type, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [inference, training, coordinator]
+        status:
+          $ref: '#/components/schemas/AgentStatus'
+        resourceProfile:
+          $ref: '#/components/schemas/ResourceProfile'
+        lastHeartbeat:
+          type: string
+          format: date-time
+
+    ResourceRequest:
+      type: object
+      required: [type, quantity]
+      properties:
+        type:
+          type: string
+          enum: [GPU, TPU, Memory, Bandwidth]
+        quantity:
+          type: integer
+          minimum: 1
+        priority:
+          type: string
+          enum: [critical, high, normal]
+        duration:
+          type: integer
+          description: Requested allocation time in seconds
+
+  parameters:
+    page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        default: 1
+        minimum: 1
+    agentId:
+      name: agentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+      headers:
+        X-RateLimit-Limit:
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          schema: 
+            type: integer
+
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.xibra.network/oauth2/token
+          scopes:
+            agents:rw: Agent management
+            resources:rw: Resource control
+
+webhooks:
+  agentStatusChanged:
+    post:
+      description: Webhook for agent status updates
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentStatusEvent'
+      responses:
+        202:
+          description: Webhook accepted
+
+x-enterprise:
+  auditRequirements:
+    - PCI-DSS
+    - SOC2
+  sla: 
+    availability: 99.99%
+    responseTime: 500ms

@@ -1,0 +1,215 @@
+syntax = "proto3";
+
+package xibra.network.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/xibra-network/proto/messaging/v1";
+option java_multiple_files = true;
+option java_package = "com.xibra.network.messaging.v1";
+
+// ================== Core Message Types ==================
+
+message Envelope {
+  string message_id = 1; // UUIDv7
+  oneof content {
+    ControlMessage control = 2;
+    DataMessage data = 3;
+    Heartbeat heartbeat = 4;
+  }
+  
+  Metadata metadata = 15;
+}
+
+message ControlMessage {
+  enum Command {
+    AGENT_DISCOVERY = 0;
+    TOPOLOGY_UPDATE = 1;
+    FLOW_CONTROL = 2;
+    CRYPTO_ROTATION = 3;
+  }
+  
+  Command command = 1;
+  bytes payload = 2; // CBOR-encoded command data
+}
+
+message DataMessage {
+  enum DataType {
+    TENSOR = 0;
+    JSON = 1;
+    PROTOBUF = 2;
+    BINARY = 3;
+  }
+  
+  DataType type = 1;
+  bytes payload = 2;
+  Compression compression = 3;
+  map<string, string> attributes = 4;
+}
+
+message Heartbeat {
+  enum Status {
+    HEALTHY = 0;
+    DEGRADED = 1;
+    CRITICAL = 2;
+  }
+  
+  Status status = 1;
+  repeated string active_tasks = 2;
+  ResourceMetrics resources = 3;
+}
+
+// ================== Metadata & Security ==================
+
+message Metadata {
+  google.protobuf.Timestamp timestamp = 1;
+  string source_node = 2; // X.509 Subject Alternative Name
+  repeated string route_trace = 3; // Node IDs in delivery path
+  
+  // Security context
+  DigitalSignature signature = 4;
+  EncryptionContext encryption = 5;
+  
+  // QoS parameters
+  PriorityLevel priority = 6;
+  google.protobuf.Duration ttl = 7;
+  uint32 max_retries = 8;
+  
+  // Enterprise tracing
+  string correlation_id = 9;
+  string transaction_id = 10;
+}
+
+message DigitalSignature {
+  enum Algorithm {
+    ED25519 = 0;
+    ECDSA_SECP256K1 = 1;
+    RSA_4096 = 2;
+  }
+  
+  Algorithm algorithm = 1;
+  bytes signature = 2;
+  bytes public_key = 3; // DER-encoded
+}
+
+message EncryptionContext {
+  enum Scheme {
+    AES256_GCM = 0;
+    CHACHA20_POLY1305 = 1;
+    KYBER_768 = 2; // Post-quantum
+  }
+  
+  Scheme scheme = 1;
+  bytes iv = 2;
+  bytes ephemeral_key = 3; // For ECDH key exchange
+  bytes auth_tag = 4;
+}
+
+// ================== Service Definitions ==================
+
+service MessagingService {
+  // Bidirectional stream for real-time messaging
+  rpc StreamMessages(stream Envelope) returns (stream Envelope);
+  
+  // Bulk message transfer with QoS guarantees
+  rpc BulkTransfer(BulkEnvelope) returns (BulkAck);
+  
+  // Cryptographic handshake for enterprise channels
+  rpc EstablishChannel(ChannelRequest) returns (ChannelResponse);
+}
+
+message BulkEnvelope {
+  repeated Envelope messages = 1;
+  uint32 batch_size = 2;
+  Checksum checksum = 3;
+}
+
+message BulkAck {
+  message Result {
+    string message_id = 1;
+    StatusCode code = 2;
+  }
+  
+  repeated Result results = 1;
+  google.protobuf.Timestamp processed_at = 2;
+}
+
+message ChannelRequest {
+  enum AuthMode {
+    MUTUAL_TLS = 0;
+    OAUTH2 = 1;
+    JWT = 2;
+  }
+  
+  AuthMode auth_mode = 1;
+  bytes client_cert = 2; // X.509 certificate chain
+  bytes challenge = 3; // Cryptographic nonce
+}
+
+message ChannelResponse {
+  bytes server_cert = 1;
+  bytes signed_challenge = 2;
+  bytes session_key = 3; // Encrypted with client's public key
+}
+
+// ================== Enum Definitions ==================
+
+enum PriorityLevel {
+  PRIORITY_CRITICAL = 0;
+  PRIORITY_HIGH = 1;
+  PRIORITY_NORMAL = 2;
+  PRIORITY_LOW = 3;
+}
+
+enum StatusCode {
+  SUCCESS = 0;
+  INVALID_SIGNATURE = 1;
+  DECRYPTION_FAILED = 2;
+  TTL_EXPIRED = 3;
+  RATE_LIMITED = 4;
+}
+
+enum Compression {
+  NONE = 0;
+  ZSTD = 1;
+  LZ4 = 2;
+  BROTLI = 3;
+}
+
+// ================== Resource Monitoring ==================
+
+message ResourceMetrics {
+  CpuMetrics cpu = 1;
+  MemoryMetrics memory = 2;
+  NetworkMetrics network = 3;
+  GpuMetrics gpu = 4; // Optional
+}
+
+message CpuMetrics {
+  double utilization = 1; // Percentage
+  uint64 context_switches = 2;
+}
+
+message MemoryMetrics {
+  uint64 used = 1;
+  uint64 available = 2;
+  uint64 swap_used = 3;
+}
+
+message NetworkMetrics {
+  uint64 bytes_sent = 1;
+  uint64 bytes_recv = 2;
+  uint32 retransmits = 3;
+}
+
+message GpuMetrics {
+  string model = 1;
+  double utilization = 2;
+  uint64 memory_used = 3;
+  uint64 memory_total = 4;
+}
+
+// ================== Reserved Fields ==================
+
+reserved 1000 to 2000; // Future enterprise extensions

@@ -1,0 +1,204 @@
+name: XIBRA Release Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment (staging/prod)'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - prod
+      force:
+        description: 'Force deployment ignoring checks'
+        required: false
+        default: 'false'
+        type: boolean
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  REGISTRIES: |
+    docker.io
+    ghcr.io
+    123456789012.dkr.ecr.us-east-1.amazonaws.com
+  SIGNING_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+  SLACK_WEBHOOK: ${{ secrets.SLACK_OPS_CHANNEL }}
+
+jobs:
+  versioning:
+    name: Semantic Versioning
+    runs-on: ubuntu-22.04
+    outputs:
+      semver: ${{ steps.version.outputs.semver }}
+      release_notes: ${{ steps.changelog.outputs.notes }}
+    steps:
+    - name: Checkout with Tags
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ github.ref }}
+
+    - name: Calculate Next Version
+      id: version
+      uses: mathieudutour/github-tag-action@v6
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        tag_prefix: "v"
+        release_branches: "main"
+        bump: auto
+        with_v: false
+
+    - name: Generate Changelog
+      id: changelog
+      uses: mikepenz/release-changelog-builder-action@v3
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        configuration: |
+          template: |
+            ## Changes
+            {{#each commits}}
+            - {{> commitTemplate}}
+            {{/each}}
+          commitTemplate: `{{commitMessage}}` - {{commitLink}}
+
+  build:
+    name: Secure Build
+    needs: versioning
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Build Multi-Arch Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/${{ matrix.arch }}
+        tags: |
+          ${{ env.REGISTRIES.split('\n')[0] }}/xibra-network:${{ needs.versioning.outputs.semver }}-${{ matrix.arch }}
+        sbom: true
+        provenance: true
+        labels: |
+          org.opencontainers.image.version=${{ needs.versioning.outputs.semver }}
+          org.opencontainers.image.revision=${{ github.sha }}
+
+    - name: Sign with Cosign
+      uses: sigstore/cosign-installer@v3
+      with:
+        cosign-release: 'v2.2.0'
+      run: |
+        cosign sign --key env://SIGNING_KEY ${{ env.REGISTRIES.split('\n')[0] }}/xibra-network:${{ needs.versioning.outputs.semver }}-${{ matrix.arch }}
+
+  compliance:
+    name: Compliance Checks
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - name: FOSSA License Scan
+      uses: fossas/fossa-action@v2
+      with:
+        api-key: ${{ secrets.FOSSA_API_KEY }}
+        command: test
+
+    - name: CIS Benchmark
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRIES.split('\n')[0] }}/xibra-network:${{ needs.versioning.outputs.semver }}-amd64
+        format: 'sarif'
+        scanners: config,vuln
+        security-checks: config,vuln
+        ignore-unfixed: true
+
+    - name: Terraform Compliance
+      uses: terraform-compliance/cli@v1
+      with:
+        features: ./compliance/features
+        plan_file: ./infrastructure/tfplan.out
+
+  deploy:
+    name: Environment Deployment
+    needs: [build, compliance]
+    runs-on: ubuntu-22.04
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    strategy:
+      matrix:
+        registry: ${{ fromJSON(format('[{0}]', env.REGISTRIES.replace('\n', ','))) }}
+    steps:
+    - name: Authenticate Registries
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ matrix.registry }}
+        username: ${{ secrets[format('{0}_USER', matrix.registry)] }}
+        password: ${{ secrets[format('{0}_TOKEN', matrix.registry)] }}
+
+    - name: Deploy to Kubernetes
+      uses: steebchen/kubectl@v2
+      with:
+        config: ${{ secrets.KUBECONFIG }}
+        command: |
+          helm upgrade xibra-network ./charts/xibra \
+            --install \
+            --namespace ${{ github.event.inputs.environment }} \
+            --set image.registry=${{ matrix.registry }} \
+            --set image.tag=${{ needs.versioning.outputs.semver }} \
+            --atomic \
+            --timeout 5m
+
+    - name: Post-Deployment Tests
+      uses: nick-invision/assert-action@v2
+      with:
+        tests: |
+          - name: "API Health Check"
+            type: "http"
+            url: "https://${{ github.event.inputs.environment }}.xibra.network/health"
+            expectedStatus: 200
+            timeout: 30000
+          - name: "gRPC Service Discovery"
+            type: "grpc"
+            endpoint: "${{ github.event.inputs.environment }}.xibra.network:50051"
+            service: "xibra.orchestration.v1.NodeService"
+
+  post-release:
+    name: Post-Release Actions
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ needs.versioning.outputs.semver }}
+        name: Release ${{ needs.versioning.outputs.semver }}
+        body: ${{ needs.versioning.outputs.release_notes }}
+        artifacts: "build/*.tar.gz"
+        discussion_category_name: "Announcements"
+
+    - name: Notify Slack
+      uses: slackapi/slack-github-action@v2
+      with:
+        channel-id: "C05ABCDEF"
+        slack-message: |
+          :rocket: *XIBRA ${{ needs.versioning.outputs.semver }} Deployed* 
+          Environment: `${{ github.event.inputs.environment }}`
+          Status: ${{ needs.deploy.result == 'success' && 'SUCCESS' || 'FAILED' }}
+          Commit: <https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${GITHUB_SHA:0:7}>
+      env:
+        SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK }}
+
+    - name: Rollback on Failure
+      if: needs.deploy.result == 'failure'
+      uses: nick-fields/rerun@v2
+      with:
+        workflow: rollback.yml
+        workflowInputs: |
+          {
+            "target_env": "${{ github.event.inputs.environment }}",
+            "previous_version": "${{ needs.versioning.outputs.semver }}"
+          }

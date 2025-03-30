@@ -1,0 +1,216 @@
+name: XIBRA Test Suite
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+  pull_request:
+    branches: [ "*" ]
+
+env:
+  PYTHON_VERSION: "3.10"
+  RUST_VERSION: "1.75"
+  GO_VERSION: "1.21"
+  POSTGRES_DB: "testdb"
+  POSTGRES_USER: "postgres"
+  POSTGRES_PASSWORD: "postgres"
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        component: 
+          - "core/hybrid_communication"
+          - "core/causal_orchestration"
+          - "core/quantum_security"
+          - "services"
+    services:
+      postgres:
+        image: postgres:15-alpine
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup Multi-Language Environment
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust@v1
+      with:
+        rust-version: ${{ env.RUST_VERSION }}
+        components: rustfmt, clippy
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.cargo/registry
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-${{ matrix.component }}-${{ hashFiles('**/requirements.txt', '**/Cargo.lock', '**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.component }}-
+
+    - name: Python Unit Tests
+      if: contains(matrix.component, 'hybrid_communication') || contains(matrix.component, 'causal_orchestration')
+      run: |
+        pip install -r tests/requirements.txt
+        pytest ${{ matrix.component }} \
+          --junitxml=test-results/python-${{ matrix.component }}.xml \
+          --cov=${{ matrix.component }} \
+          --cov-report=xml:coverage.xml
+      env:
+        PYTHONPATH: ${{ github.workspace }}
+
+    - name: Rust Tests
+      if: contains(matrix.component, 'quantum_security')
+      run: |
+        cargo test --manifest-path ${{ matrix.component }}/Cargo.toml \
+          --no-fail-fast \
+          -- -Z unstable-options --format=junit > test-results/rust.xml
+        cargo tarpaulin --out Xml --output-dir test-results
+
+    - name: Go Tests
+      if: contains(matrix.component, 'services')
+      run: |
+        go test -v ${{ matrix.component }}/... \
+          -coverprofile=test-results/coverage.out \
+          -json > test-results/go.json
+        gocov convert test-results/go.json > test-results/coverage.json
+
+    - name: Upload Test Results
+      uses: actions/upload-artifact@v3
+      with:
+        name: unit-test-results-${{ matrix.component }}
+        path: test-results/
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-22.04
+    needs: unit-tests
+    timeout-minutes: 30
+    env:
+      MLFLOW_TRACKING_URI: http://localhost:5000
+    services:
+      mlflow:
+        image: mlflow/mlflow:2.8.0
+        ports: ["5000:5000"]
+      kafka:
+        image: bitnami/kafka:3.6
+        ports: ["9092:9092"]
+        env:
+          KAFKA_ENABLE_KRAFT: "yes"
+          KAFKA_CFG_NODE_ID: 0
+          KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+          KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+          KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Start Test Cluster
+      run: |
+        docker-compose -f tests/integration/docker-compose.yml up -d
+        ./tests/integration/wait-for-services.sh
+
+    - name: Run Integration Suite
+      run: |
+        pytest tests/integration \
+          --junitxml=integration-results.xml \
+          -n 4 \
+          --cov=core \
+          --cov-report=html:cov_html
+      env:
+        PYTHONPATH: ${{ github.workspace }}
+
+    - name: Upload Coverage
+      uses: codecov/codecov-action@v3
+      with:
+        files: coverage.xml
+        directory: cov_html
+        flags: integration
+
+    - name: Store Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: integration-results
+        path: |
+          integration-results.xml
+          cov_html/
+
+  quality-gates:
+    name: Quality Gates
+    runs-on: ubuntu-22.04
+    needs: [unit-tests, integration-tests]
+    steps:
+    - name: Download All Results
+      uses: actions/download-artifact@v3
+
+    - name: SonarCloud Analysis
+      uses: sonarsource/sonarcloud-github-action@master
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      with:
+        args: >
+          -Dsonar.python.coverage.reportPaths=**/coverage.xml
+          -Dsonar.go.coverage.reportPaths=**/coverage.json
+          -Dsonar.cfamily.build-wrapper-output=bw-output
+
+    - name: Security Audit
+      run: |
+        cargo audit --ignore RUSTSEC-2023-0001
+        pip-audit
+        go list -json -m all | govulncheck -json ./...
+
+    - name: Check License Compliance
+      uses: fossas/fossa-action@v2
+      with:
+        api-key: ${{ secrets.FOSSA_API_KEY }}
+
+  performance-tests:
+    name: Performance Benchmarks
+    runs-on: [self-hosted, GPU]
+    needs: quality-gates
+    strategy:
+      matrix:
+        scenario: ["throughput", "latency", "stress"]
+    steps:
+    - name: Run Benchmark
+      run: |
+        python tests/bench/${{ matrix.scenario }}.py \
+          --duration 300 \
+          --output bench-${{ matrix.scenario }}.json
+      env:
+        CUDA_VISIBLE_DEVICES: 0
+
+    - name: Visualize Metrics
+      uses: githubocto/flame@v1
+      with:
+        name: perf-report
+        file: bench-*.json
+
+    - name: Upload Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-${{ matrix.scenario }}
+        path: bench-*.json
